@@ -318,7 +318,7 @@ details.bagian>.dalam{padding:0 16px 16px}
 </script>
 <script>
 /* ===== UndangKita v2 — inti: transport, util, media, QR, musik ===== */
-var VERSI_KLIEN = '2.1.0';
+var VERSI_KLIEN = '2.2.0';
 var CFG = window.UNDANGKITA_CONFIG || {};
 var MODE = (window.google && google.script && google.script.run) ? 'GAS' : 'WEB';
 var S = { sesi: null, pengguna: null, data: null, tab: 'dashboard', online: navigator.onLine !== false, versiServer: '' };
@@ -425,7 +425,7 @@ function panggil(aksi, data) {
   if (!PUBLIK[aksi]) data.sesi = S.sesi;
   return new Promise(function (ok, gagal) {
     var selesai = false;
-    var jaga = setTimeout(function () { if (!selesai) { selesai = true; gagal({ pesan: 'Server tidak menjawab (60 detik). Periksa koneksi lalu coba lagi.', offline: true }); } }, 60000);
+    var jaga = setTimeout(function () { if (!selesai) { selesai = true; gagal({ pesan: 'Server tidak menjawab (60 detik). Periksa koneksi lalu coba lagi.', offline: true, sementara: true }); } }, 60000);
     function terima(r) {
       if (selesai) return; selesai = true; clearTimeout(jaga);
       if (r && r.versi) cekVersi(r.versi);
@@ -435,13 +435,26 @@ function panggil(aksi, data) {
       }
       ok(r);
     }
-    function tolak(e) { if (selesai) return; selesai = true; clearTimeout(jaga); gagal({ pesan: (e && e.message) || String(e), offline: true }); }
+    function tolak(e) {
+      if (selesai) return; selesai = true; clearTimeout(jaga);
+      var m = (e && e.message) || String(e);
+      if (/Failed to fetch|NetworkError|Load failed|network/i.test(m)) m = 'Koneksi ke server Google terputus. Periksa sinyal lalu coba lagi.';
+      gagal({ pesan: m, offline: true, sementara: true });
+    }
     if (MODE === 'GAS') {
       google.script.run.withSuccessHandler(terima).withFailureHandler(tolak).api(aksi, data);
     } else {
       if (!CFG.GAS_URL || CFG.GAS_URL.indexOf('/exec') < 0) { tolak(new Error('GAS_URL belum diisi di config.js')); return; }
       fetch(CFG.GAS_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify({ aksi: aksi, data: data }), redirect: 'follow' })
-        .then(function (res) { return res.json(); }).then(terima, tolak);
+        .then(function (res) {
+          return res.text().then(function (t) {
+            try { return JSON.parse(t); } catch (e) {
+              // Google mengirim halaman galat HTML (sibuk, batas kuota, waktu habis) → jangan tampilkan "Unexpected token '<'"
+              var html = /^\s*</.test(t), judul = (/<title>([^<]*)</i.exec(t) || [])[1] || '';
+              throw new Error(html ? 'Server Google sedang sibuk atau membatasi permintaan (HTTP ' + res.status + (judul ? ', ' + judul.trim() : '') + '). Coba lagi sebentar.' : 'Jawaban server tidak dapat dibaca.');
+            }
+          });
+        }).then(terima, tolak);
     }
   });
 }
@@ -529,19 +542,74 @@ function kompresGambar(berkas, maks, mutu) {
 }
 function bacaDataUrl(berkas) { return new Promise(function (ok, gagal) { var r = new FileReader(); r.onload = function () { ok(r.result); }; r.onerror = function () { gagal({ pesan: 'Gagal membaca berkas' }); }; r.readAsDataURL(berkas); }); }
 
-/** Unggah dataURL besar ke lembar Berkas, potongan 45.000 karakter (batas sel Sheets). */
+/** Panggil dengan coba-ulang untuk galat sementara (jaringan putus, halaman galat Google). */
+function panggilUlang(aksi, data, kali, jeda) {
+  kali = kali || 4; jeda = jeda || 1500;
+  return panggil(aksi, data).catch(function (e) {
+    if (!e || !e.sementara || kali <= 1) throw e;
+    return new Promise(function (ok) { setTimeout(ok, jeda + Math.random() * 500); }).then(function () { return panggilUlang(aksi, data, kali - 1, Math.min(jeda * 2, 15000)); });
+  });
+}
+
+/**
+ * Unggah dataURL besar ke lembar Berkas.
+ * - dipotong 45.000 karakter (di bawah batas sel 50.000), dikirim 8 potongan per permintaan
+ *   (MP3 5 MB: ±19 permintaan, dulu ±150);
+ * - tiap kiriman dicoba ulang otomatis; server idempoten sehingga kiriman ulang tidak menggandakan data;
+ * - bila jaringan putus terlalu lama, galat membawa .lanjutkan() untuk meneruskan dari potongan terakhir.
+ * kemajuan(pecahan, keterangan)
+ */
 function unggahBerkas(dataUrl, nama, kemajuan) {
   var POT = 45000, bag = [];
   for (var i = 0; i < dataUrl.length; i += POT) bag.push(dataUrl.slice(i, i + POT));
   var mime = (/^data:([^;]+)/.exec(dataUrl) || [])[1] || '';
-  return panggil('berkas_mulai', { ukuran: dataUrl.length, jumlah: bag.length, mime: mime, nama: nama }).then(function (r) {
-    var id = r.id, n = 0;
-    function lanjut() {
-      if (n >= bag.length) { CACHE_MEDIA[id] = Promise.resolve(dataUrl); return '@@berkas:' + id; }
-      return panggil('berkas_potong', { id: id, urutan: n, isi: bag[n] }).then(function () { n++; if (kemajuan) kemajuan(n / bag.length); return lanjut(); });
-    }
-    return lanjut();
-  });
+  var st = { id: null, per: 8, terkirim: {}, mulai: Date.now(), byte: 0 };
+  var meta = function () { return { id: st.id, jumlah: bag.length, mime: mime, nama: nama }; };
+  var kunciLayar = null;
+  try { if (navigator.wakeLock) navigator.wakeLock.request('screen').then(function (k) { kunciLayar = k; }, function () {}); } catch (e) {}
+  function lepas() { try { if (kunciLayar) kunciLayar.release(); } catch (e) {} }
+  function lapor() {
+    if (!kemajuan) return;
+    var n = Object.keys(st.terkirim).length, dtk = (Date.now() - st.mulai) / 1000, laju = st.byte / Math.max(dtk, 1);
+    var sisa = laju > 0 ? Math.round((dataUrl.length - st.byte) / laju) : 0;
+    kemajuan(n / bag.length, Math.round(n / bag.length * 100) + '% · ' + (laju / 1024).toFixed(0) + ' KB/dtk' + (n < bag.length && sisa ? ' · sisa ±' + (sisa > 90 ? Math.round(sisa / 60) + ' mnt' : sisa + ' dtk') : ''));
+  }
+  function kirimSisa() {
+    var sisa = []; for (var j = 0; j < bag.length; j++) if (!st.terkirim[j]) sisa.push(j);
+    if (!sisa.length) return Promise.resolve();
+    var kelompok = sisa.slice(0, st.per);
+    var d = meta(); d.potongan = kelompok.map(function (u) { return { u: u, isi: bag[u] }; });
+    return panggilUlang('berkas_potong', d, 3).then(function () {
+      kelompok.forEach(function (u) { st.terkirim[u] = 1; st.byte += bag[u].length; }); lapor();
+      if (st.per < 8) st.per++;                       // pulih perlahan setelah jaringan membaik
+      return kirimSisa();
+    }, function (e) {
+      if (e && e.sementara && st.per > 1) { st.per = Math.max(1, Math.floor(st.per / 2)); return kirimSisa(); }   // kecilkan kiriman
+      throw e;
+    });
+  }
+  function tuntaskan(putaran) {
+    return kirimSisa().then(function () { return panggilUlang('berkas_selesai', meta(), 3); }).then(function (r) {
+      if (r.lengkap) { CACHE_MEDIA[st.id] = Promise.resolve(dataUrl); lepas(); return r.rujukan; }
+      if (putaran >= 3) throw { pesan: 'Sebagian potongan tidak tersimpan di server.' };
+      r.kurang.forEach(function (u) { delete st.terkirim[u]; });
+      return tuntaskan(putaran + 1);
+    });
+  }
+  function bungkus(e) {
+    lepas();
+    var n = Object.keys(st.terkirim).length;
+    var g = { pesan: 'Unggah terhenti di ' + Math.round(n / bag.length * 100) + '%: ' + ((e && e.pesan) || 'galat tak dikenal'), sementara: true, dapatLanjut: !!st.id };
+    g.lanjutkan = function () {
+      try { if (navigator.wakeLock) navigator.wakeLock.request('screen').then(function (k) { kunciLayar = k; }, function () {}); } catch (x) {}
+      st.mulai = Date.now(); st.byte = 0; st.per = 4;
+      var awal = st.id ? panggilUlang('berkas_status', meta(), 3).then(function (r) { st.terkirim = {}; r.urutan.forEach(function (u) { st.terkirim[u] = 1; }); lapor(); }) : mulai();
+      return awal.then(function () { return tuntaskan(0); }).catch(function (e2) { throw bungkus(e2); });
+    };
+    return g;
+  }
+  function mulai() { return panggilUlang('berkas_mulai', { ukuran: dataUrl.length, jumlah: bag.length, mime: mime, nama: nama }, 3).then(function (r) { st.id = r.id; st.per = r.per_kirim || 8; lapor(); }); }
+  return mulai().then(function () { return tuntaskan(0); }).catch(function (e) { throw bungkus(e); });
 }
 
 /* ---------- QR ---------- */
@@ -1235,7 +1303,7 @@ function viewPengaturan(el) {
     bag('privasi', 'Privasi & dokumen hukum', '<p class="bantu" style="margin-top:0">Anda adalah pengendali data tamu (UU PDP). Isian ini tampil di Kebijakan Privasi yang dibaca tamu.</p><div class="kisi k3">' + f('pengendali_data', 'Penanggung jawab data', 'text', { ph: 'cth. Keluarga Bpk. Bambang' }) + f('kontak_privasi', 'Kontak permintaan data', 'text', { ph: 'email / WA' }) + f('retensi_hari', 'Simpan data sampai (hari setelah acara)', 'number') + '</div>' +
       '<div class="baris" style="margin-top:10px"><button class="tbl kecil" data-lihatdok="privasi">Lihat Kebijakan Privasi</button><button class="tbl kecil" data-lihatdok="syarat-tamu">Lihat Syarat Penggunaan</button><button class="tbl kecil" data-lihatdok="syarat-lisensi">Lihat Syarat Lisensi</button></div>' +
       (S.data.syarat ? '<p class="bantu">Syarat Lisensi v' + esc(S.data.syarat.versi) + ' disetujui oleh ' + esc(S.data.syarat.oleh) + ' pada ' + esc(S.data.syarat.waktu) + '.</p>' : '')) +
-    bag('data', 'Data', '<p class="bantu" style="margin-top:0">Semua data ada di spreadsheet Anda. Cadangkan lewat Berkas › Buat salinan di Google Sheets.</p><div class="baris"><button class="tbl" id="csv2">' + IK.unduh + 'Ekspor tamu CSV</button><button class="tbl" id="anonimkan">Anonimkan data tamu</button><button class="tbl bahaya" id="kosongkan">Hapus semua tamu</button><button class="tbl bahaya" id="demo">Kembalikan data contoh</button></div><p class="bantu">Anonimkan: menghapus nomor WhatsApp, kota, dan catatan semua tamu (nama, RSVP, dan kehadiran tetap untuk kenang-kenangan). Lakukan setelah masa retensi.</p>') +
+    bag('data', 'Data', '<p class="bantu" style="margin-top:0">Semua data ada di spreadsheet Anda. Cadangkan lewat Berkas › Buat salinan di Google Sheets.</p><div class="baris"><button class="tbl" id="csv2">' + IK.unduh + 'Ekspor tamu CSV</button><button class="tbl" id="anonimkan">Anonimkan data tamu</button><button class="tbl" id="bersihkan">Bersihkan berkas tak terpakai</button><button class="tbl bahaya" id="kosongkan">Hapus semua tamu</button><button class="tbl bahaya" id="demo">Kembalikan data contoh</button></div><p class="bantu">Anonimkan: menghapus nomor WhatsApp, kota, dan catatan semua tamu (nama, RSVP, dan kehadiran tetap untuk kenang-kenangan). Lakukan setelah masa retensi.</p>') +
     '<div style="position:sticky;bottom:calc(76px + var(--aman-bawah));margin-top:12px;display:flex;justify-content:flex-end"><button class="tbl utama" id="simpan" style="box-shadow:0 6px 20px rgba(0,0,0,.2)">Simpan pengaturan</button></div>';
 
   // isian sederhana
@@ -1269,9 +1337,25 @@ function viewPengaturan(el) {
   $('#uji-musik', el).onclick = function () { if (Musik.aktif()) { Musik.henti(); this.innerHTML = IK.musik + 'Uji putar'; return; } var t = this; t.textContent = 'Memuat…'; Musik.putar(D.music_url, D.music_preset_id).then(function (h) { t.innerHTML = IK.senyap + 'Hentikan'; if (h === 'cadangan') toast('Berkas musik tidak dapat diputar, memakai musik sintesis.', 'galat'); }); };
   $('#unggah-musik', el).onclick = function () {
     pilihBerkas('audio/*', false, function (fs) {
-      var fl = fs[0]; if (fl.size > 5 * 1048576) return toast('MP3 maksimal 5 MB. Potong/kompres dulu (mis. 96 kbps) atau pakai URL.', 'galat');
-      var info = $('#musik-info'); info.textContent = 'Membaca…';
-      bacaDataUrl(fl).then(function (du) { return unggahBerkas(du, fl.name, function (p) { info.textContent = 'Mengunggah ' + Math.round(p * 100) + '%'; }); }).then(function (ref) { D.music_url = ref; D.music_preset_id = 'unggahan'; D.music_title = fl.name.replace(/\.[^.]+$/, ''); D.music_artist = 'Unggahan'; ulang('musik'); toast('Musik diunggah. Tekan Simpan.', 'sukses'); }, function (e) { info.textContent = ''; galat(e); });
+      var fl = fs[0]; if (fl.size > 5 * 1048576) return toast('MP3 maksimal 5 MB. Kompres dulu ke 96–128 kbps (3–4 menit ≈ 3 MB) atau pakai URL.', 'galat');
+      var info = $('#musik-info'), tombol = $('#unggah-musik');
+      var kotak = document.createElement('div'); kotak.className = 'kartu'; kotak.style.marginTop = '10px';
+      kotak.innerHTML = '<div class="baris antara"><b>' + esc(fl.name) + '</b><span class="bantu">' + (fl.size / 1048576).toFixed(1) + ' MB</span></div><div class="progres" style="margin:8px 0"><i id="bar-musik"></i></div><div class="bantu" id="ket-musik">Menyiapkan…</div><div class="baris" id="aksi-musik" style="margin-top:8px"></div><p class="bantu">Jangan tutup halaman ini. Layar dijaga tetap menyala selama mengunggah bila perangkat mendukung.</p>';
+      tombol.parentNode.parentNode.insertBefore(kotak, tombol.parentNode.nextSibling);
+      tombol.disabled = true; $('#simpan').disabled = true;
+      function maju(p, ket) { $('#bar-musik').style.width = Math.round(p * 100) + '%'; $('#ket-musik').textContent = 'Mengunggah ' + ket; }
+      function berhasil(ref) { D.music_url = ref; D.music_preset_id = 'unggahan'; D.music_title = fl.name.replace(/\.[^.]+$/, ''); D.music_artist = 'Unggahan'; tombol.disabled = false; $('#simpan').disabled = false; ulang('musik'); toast('Musik terunggah. Tekan Simpan pengaturan.', 'sukses'); }
+      function gagal(e) {
+        tombol.disabled = false; $('#simpan').disabled = false;
+        $('#ket-musik').innerHTML = '<span style="color:var(--kesumba)">' + esc(e.pesan || 'Gagal') + '</span>';
+        if (e.lanjutkan) {
+          $('#aksi-musik').innerHTML = '<button class="tbl utama kecil" id="lanjut-musik">' + IK.segar + 'Lanjutkan unggah</button><button class="tbl kecil" id="batal-musik">Batal</button>';
+          $('#lanjut-musik').onclick = function () { $('#aksi-musik').innerHTML = ''; tombol.disabled = true; $('#simpan').disabled = true; $('#ket-musik').textContent = 'Melanjutkan…'; e.lanjutkan().then(berhasil, gagal); };
+          $('#batal-musik').onclick = function () { kotak.remove(); };
+          if (e.dapatLanjut) window.addEventListener('online', function sekali() { window.removeEventListener('online', sekali); var b = $('#lanjut-musik'); if (b) b.click(); });
+        }
+      }
+      bacaDataUrl(fl).then(function (du) { return unggahBerkas(du, fl.name, maju); }).then(berhasil, gagal);
     });
   };
   // tema
@@ -1290,6 +1374,7 @@ function viewPengaturan(el) {
   var ll = $('#lepas-lis', el); if (ll) ll.onclick = function () { konfirmasi('Lepas lisensi dan kembali ke paket Gratis?', function () { panggil('lisensi_pasang', { kode: '' }).then(function () { D = null; muatAdmin(); }, galat); }); };
   // data
   $('#csv2', el).onclick = eksporCsv;
+  $('#bersihkan', el).onclick = function () { var t = this; t.disabled = true; panggil('berkas_bersihkan').then(function (r) { t.disabled = false; toast(r.berkas ? r.berkas + ' unggahan gagal/ditinggal dihapus (' + r.baris + ' baris)' : 'Tidak ada berkas tak terpakai', 'sukses'); }, function (e) { t.disabled = false; galat(e); }); };
   $$('[data-lihatdok]', el).forEach(function (x) { x.onclick = function () { tampilDokumen(x.dataset.lihatdok, D); }; });
   $('#anonimkan', el).onclick = function () { var m = modal('Anonimkan data tamu', '<p>Nomor WhatsApp, kota, dan catatan seluruh tamu dihapus permanen. Nama, RSVP, dan kehadiran tetap tersimpan.</p><label class="cek"><input type="checkbox" id="an-uc">Hapus juga semua ucapan</label><p>Ketik <b>ANONIMKAN</b>:</p><input class="isian" id="an-k"><div class="modal-kaki"><button class="tbl" data-tutup>Batal</button><button class="tbl bahaya penuh" id="an-ok">Anonimkan</button></div>'); $('#an-ok', m).onclick = function () { panggil('data_anonimkan', { konfirmasi: $('#an-k', m).value, hapusUcapan: $('#an-uc', m).checked }).then(function (r) { tutupModal(); toast(r.jumlah + ' tamu dianonimkan', 'sukses'); muatAdmin(true); }, galat); }; };
   $('#kosongkan', el).onclick = function () { var m = modal('Hapus semua tamu', '<p>Semua data tamu, RSVP, ucapan & check-in akan dihapus permanen. Ketik <b>KOSONGKAN</b>:</p><input class="isian" id="kf"><div class="modal-kaki"><button class="tbl" data-tutup>Batal</button><button class="tbl bahaya penuh" id="kok">Hapus</button></div>'); $('#kok', m).onclick = function () { panggil('data_kosongkan', { konfirmasi: $('#kf', m).value }).then(function () { tutupModal(); muatAdmin(); }, galat); }; };
@@ -1510,6 +1595,7 @@ document.addEventListener('DOMContentLoaded', mulai);
 /* ===== Tentang aplikasi, Syarat & Ketentuan, Kebijakan Privasi ===== */
 var TANGGAL_RILIS = '2026-09-30', VERSI_DOKUMEN = '1.0';
 var RIWAYAT = [
+  ['2.2.0', '30 Sep 2026', 'Unggah MP3/foto jauh lebih cepat & andal: 8 potongan per permintaan, coba-ulang otomatis, dapat dilanjutkan setelah sinyal putus, tanpa potongan ganda; pesan galat server Google yang jelas; hapus berkas lama berblok; bersihkan berkas tak terpakai.'],
   ['2.1.0', '30 Sep 2026', 'Pratinjau instan tanpa menunggu server; foto dimuat berkelompok; peta dimuat saat terlihat; Tentang aplikasi; Syarat & Ketentuan; Kebijakan Privasi; hak tamu menarik RSVP/ucapan; anonimkan data setelah acara.'],
   ['2.0.1', '30 Sep 2026', 'Perbaikan galat login (Utilities.getUuid) dan batas masa sesi CacheService.'],
   ['2.0.0', '30 Sep 2026', 'Penulisan ulang ke Google Apps Script + Sheets, PWA offline, QR check-in, lisensi.']

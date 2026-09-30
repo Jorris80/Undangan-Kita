@@ -1,7 +1,7 @@
 /* UndangKita service worker — cangkang aplikasi offline + cache font.
  * Data (tamu, RSVP, check-in) TIDAK dicache di sini: aplikasi menyimpannya di
  * localStorage dan antrean check-in offline dikirim saat online. */
-var VERSI = 'undangkita-v2.1.0';
+var VERSI = 'undangkita-v2.2.0';
 var CANGKANG = ['./', './index.html', './config.js', './manifest.json', './icon.svg'];
 self.addEventListener('install', function (e) {
   e.waitUntil(caches.open(VERSI).then(function (c) { return c.addAll(CANGKANG); }).then(function () { return self.skipWaiting(); }));
